@@ -97,7 +97,19 @@ class MonoDriver(Node):
         self.sub_exp_ack_name = "/mono_py_driver/exp_settings_ack"
         self.pub_img_to_agent_name = "/mono_py_driver/img_msg"
         self.pub_timestep_to_agent_name = "/mono_py_driver/timestep_msg"
+        self.pub_imu_to_agent_name = "/imu/data"  # Default IMU topic that matches launch file
         self.send_config = True # Set False once handshake is completed with the cpp node
+        self.use_imu = False  # Whether to publish IMU data (if available)
+        
+        # Check if IMU data directory exists
+        agent_imu_fld = self.image_sequence_dir + "/mav0/imu0"
+        self.imu_data_path = agent_imu_fld + "/data.csv" if os.path.exists(agent_imu_fld) else None
+        if self.imu_data_path and os.path.exists(self.imu_data_path):
+            self.use_imu = True
+            self.imu_data = self.load_imu_data(self.imu_data_path)
+            print(f"Found IMU data at: {self.imu_data_path}")
+        else:
+            print("No IMU data found. Running in image-only mode.")
         
         #* Setup ROS2 publishers and subscribers
         self.publish_exp_config_ = self.create_publisher(String, self.pub_exp_config_name, 1) # Publish configs to the ORB-SLAM3 C++ node
@@ -117,7 +129,13 @@ class MonoDriver(Node):
         # Publisher to send RGB image
         self.publish_img_msg_ = self.create_publisher(Image, self.pub_img_to_agent_name, 1)
         
+        # Publisher for timestamp and IMU data
         self.publish_timestep_msg_ = self.create_publisher(Float64, self.pub_timestep_to_agent_name, 1)
+        
+        # Initialize IMU publisher if IMU data is available
+        if self.use_imu:
+            from sensor_msgs.msg import Imu
+            self.publish_imu_msg_ = self.create_publisher(Imu, self.pub_imu_to_agent_name, 10)
 
 
         # Initialize work variables for main logic
@@ -157,6 +175,33 @@ class MonoDriver(Node):
 
         return imgz_file_dir, imgz_file_list, time_list
     # ****************************************************************************************
+    
+    # ****************************************************************************************
+    def load_imu_data(self, imu_file_path):
+        """
+        Load IMU data from EuRoC format CSV file
+        Format: timestamp [ns], w_x [rad/s], w_y [rad/s], w_z [rad/s], a_x [m/s^2], a_y [m/s^2], a_z [m/s^2]
+        """
+        imu_data = {}
+        try:
+            with open(imu_file_path, 'r') as f:
+                # Skip header line
+                next(f)
+                for line in f:
+                    values = line.strip().split(',')
+                    if len(values) == 7:
+                        timestamp = float(values[0])  # nanoseconds
+                        # Store angular velocity (w) and linear acceleration (a)
+                        imu_data[timestamp] = {
+                            'w': [float(values[1]), float(values[2]), float(values[3])],
+                            'a': [float(values[4]), float(values[5]), float(values[6])]
+                        }
+            print(f"Loaded {len(imu_data)} IMU measurements")
+            return imu_data
+        except Exception as e:
+            print(f"Error loading IMU data: {e}")
+            return {}
+    # ****************************************************************************************
 
     # ****************************************************************************************
     def ack_callback(self, msg):
@@ -187,29 +232,76 @@ class MonoDriver(Node):
     def run_py_node(self, idx, imgz_name):
         """
             Master function that sends the RGB image message to the CPP node
+            Also sends IMU data if available
         """
 
         # Initialize work variables
         img_msg = None # sensor_msgs image object
 
         # Path to this image
-        img_look_up_path = self.imgz_seqz_dir  + imgz_name
-        timestep = float(imgz_name.split(".")[0]) # Kept if you use a custom message interface to also pass timestep value
+        img_look_up_path = self.imgz_seqz_dir + imgz_name
+        timestep = float(imgz_name.split(".")[0]) # Timestamp in nanoseconds
         self.frame_id = self.frame_id + 1  
         #print(img_look_up_path)
         # print(f"Frame ID: {frame_id}")
 
-        # Based on the tutorials
+        # Create and publish image message
         img_msg = self.br.cv2_to_imgmsg(cv2.imread(img_look_up_path), encoding="passthrough")
         timestep_msg = Float64()
         timestep_msg.data = timestep
 
-        # Publish RGB image and timestep, must be in the order shown below. I know not very optimum, you can use a custom message interface to send both
+        # Publish corresponding IMU data if available
+        if self.use_imu and hasattr(self, 'publish_imu_msg_'):
+            self.publish_imu_data(timestep)
+            
+        # Publish RGB image and timestep, must be in the order shown below
         try:
             self.publish_timestep_msg_.publish(timestep_msg) 
             self.publish_img_msg_.publish(img_msg)
         except CvBridgeError as e:
             print(e)
+    # ****************************************************************************************
+    
+    # ****************************************************************************************
+    def publish_imu_data(self, current_timestamp):
+        """
+        Publish IMU data corresponding to the current image timestamp
+        For simplicity, publishes the closest IMU measurement to the current image timestamp
+        """
+        if not self.imu_data:
+            return
+            
+        from sensor_msgs.msg import Imu
+        from geometry_msgs.msg import Vector3
+        from rclpy.time import Time
+        
+        # Find the closest IMU measurement to the current image timestamp
+        closest_timestamp = min(self.imu_data.keys(), key=lambda x: abs(x - current_timestamp))
+        imu_measurement = self.imu_data[closest_timestamp]
+        
+        # Create IMU message
+        imu_msg = Imu()
+        # Set header
+        imu_msg.header.stamp = self.get_clock().now().to_msg()
+        imu_msg.header.frame_id = "imu"
+        
+        # Set angular velocity (rad/s)
+        imu_msg.angular_velocity.x = imu_measurement['w'][0]
+        imu_msg.angular_velocity.y = imu_measurement['w'][1]
+        imu_msg.angular_velocity.z = imu_measurement['w'][2]
+        
+        # Set linear acceleration (m/s^2)
+        imu_msg.linear_acceleration.x = imu_measurement['a'][0]
+        imu_msg.linear_acceleration.y = imu_measurement['a'][1]
+        imu_msg.linear_acceleration.z = imu_measurement['a'][2]
+        
+        # Set default covariance (replace with actual values if available)
+        # -1 indicates unknown covariance
+        imu_msg.angular_velocity_covariance = [0.01, 0, 0, 0, 0.01, 0, 0, 0, 0.01]
+        imu_msg.linear_acceleration_covariance = [0.01, 0, 0, 0, 0.01, 0, 0, 0, 0.01]
+        
+        # Publish IMU message
+        self.publish_imu_msg_.publish(imu_msg)
     # ****************************************************************************************
         
 
