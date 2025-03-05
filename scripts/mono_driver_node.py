@@ -89,8 +89,8 @@ class MonoDriver(Node):
         # Read images from the chosen dataset, order them in ascending order and prepare timestep data as well
         self.imgz_seqz_dir, self.imgz_seqz, self.time_seqz = self.get_image_dataset_asl(self.image_sequence_dir, "mav0") 
 
-        print(self.image_seq_dir)
-        print(len(self.imgz_seqz))
+        print("self.image_seq_dir", self.image_seq_dir)
+        print("len(self.imgz_seqz)", len(self.imgz_seqz))
 
         #* ROS2 publisher/subscriber variables [HARDCODED]
         self.pub_exp_config_name = "/mono_py_driver/experiment_settings" 
@@ -105,9 +105,9 @@ class MonoDriver(Node):
         agent_imu_fld = self.image_sequence_dir + "/mav0/imu0"
         self.imu_data_path = agent_imu_fld + "/data.csv" if os.path.exists(agent_imu_fld) else None
         if self.imu_data_path and os.path.exists(self.imu_data_path):
+            print(f"Found IMU data at: {self.imu_data_path}")
             self.use_imu = True
             self.imu_data = self.load_imu_data(self.imu_data_path)
-            print(f"Found IMU data at: {self.imu_data_path}")
         else:
             print("No IMU data found. Running in image-only mode.")
         
@@ -186,6 +186,7 @@ class MonoDriver(Node):
         try:
             with open(imu_file_path, 'r') as f:
                 # Skip header line
+                print("make sure length is 7")
                 next(f)
                 for line in f:
                     values = line.strip().split(',')
@@ -297,8 +298,8 @@ class MonoDriver(Node):
         
         # Set default covariance (replace with actual values if available)
         # -1 indicates unknown covariance
-        imu_msg.angular_velocity_covariance = [0.01, 0, 0, 0, 0.01, 0, 0, 0, 0.01]
-        imu_msg.linear_acceleration_covariance = [0.01, 0, 0, 0, 0.01, 0, 0, 0, 0.01]
+        imu_msg.angular_velocity_covariance = [float(0.01), 0.0, 0.0, 0.0, float(0.01), 0.0, 0.0, 0.0, float(0.01)]
+        imu_msg.linear_acceleration_covariance = [float(0.01), 0.0, 0.0, 0.0, float(0.01), 0.0, 0.0, 0.0, float(0.01)]
         
         # Publish IMU message
         self.publish_imu_msg_.publish(imu_msg)
