@@ -86,6 +86,8 @@ MonocularMode::MonocularMode() :Node("mono_node_cpp")
     pubconfigackName = "/mono_py_driver/exp_settings_ack"; // send an acknowledgement to the python node
     subImgMsgName = "/mono_py_driver/img_msg"; // topic to receive RGB image messages
     subTimestepMsgName = "/mono_py_driver/timestep_msg"; // topic to receive RGB image messages
+    subImuMsgName = "/mono_py_driver/imu_msg"; // Use the topic from the Python driver
+    use_imu_ = true; // Enable IMU usage
 
     //* subscribe to python node to receive settings
     expConfig_subscription_ = this->create_subscription<std_msgs::msg::String>(subexperimentconfigName, 1, std::bind(&MonocularMode::experimentSetting_callback, this, _1));
@@ -98,6 +100,12 @@ MonocularMode::MonocularMode() :Node("mono_node_cpp")
 
     //* subscribe to receive the timestep
     subTimestepMsg_subscription_= this->create_subscription<std_msgs::msg::Float64>(subTimestepMsgName, 1, std::bind(&MonocularMode::Timestep_callback, this, _1));
+
+    //* subscribe to the IMU messages coming from the Python driver node
+    subImuMsg_subscription_ = this->create_subscription<sensor_msgs::msg::Imu>(
+    subImuMsgName, 100, std::bind(&MonocularMode::Imu_callback, this, _1));
+
+    RCLCPP_INFO(this->get_logger(), "Subscribed to IMU topic: %s", subImuMsgName.c_str());
 
     // Setup TF broadcasting timer if enabled
     if (publish_tf_) {
@@ -192,8 +200,8 @@ void MonocularMode::Img_callback(const sensor_msgs::msg::Image& msg)
         
         // DEBUGGING, Show image
         // Update GUI Window
-        // cv::imshow("test_window", cv_ptr->image);
-        // cv::waitKey(3);
+        cv::imshow("test_window", cv_ptr->image);
+        cv::waitKey(3);
     }
     catch (cv_bridge::Exception& e)
     {
@@ -201,20 +209,49 @@ void MonocularMode::Img_callback(const sensor_msgs::msg::Image& msg)
         return;
     }
     
-    // std::cout<<std::fixed<<"Timestep: "<<timeStep<<std::endl; // Debug
+    // Get IMU measurements for this frame
+    std::vector<ORB_SLAM3::IMU::Point> current_imu_measurements;
+    if (use_imu_) {
+        std::lock_guard<std::mutex> lock(imu_buffer_mutex_);
+        
+        // Get IMU measurements between last frame and current frame
+        for (const auto& imu_data : imu_buffer_) {
+            if (imu_data.t >= last_image_timestamp_ && imu_data.t <= timeStep) {
+                current_imu_measurements.push_back(imu_data);
+            }
+        }
+        
+        // Clean up old IMU measurements
+        if (!imu_buffer_.empty() && timeStep > 0) {
+            auto it = imu_buffer_.begin();
+            while (it != imu_buffer_.end() && it->t <= timeStep) {
+                ++it;
+            }
+            imu_buffer_.erase(imu_buffer_.begin(), it);
+        }
+        
+        // Update last image timestamp
+        last_image_timestamp_ = timeStep;
+    }
     
-    //* Perform all ORB-SLAM3 operations in Monocular mode
-    //! Pose with respect to the camera coordinate frame not the world coordinate frame
+    // Use TrackMonocular with IMU data if available
     Sophus::SE3f Tcw;
     try {
-        Tcw = pAgent->TrackMonocular(cv_ptr->image, timeStep);
+        RCLCPP_INFO(this->get_logger(), "use_imu_: %d", use_imu_);
+        if (use_imu_ && !current_imu_measurements.empty()) {
+            RCLCPP_DEBUG(this->get_logger(), "Tracking with %zu IMU measurements", 
+                       current_imu_measurements.size());
+            Tcw = pAgent->TrackMonocular(cv_ptr->image, timeStep, current_imu_measurements);
+        } else {
+            Tcw = pAgent->TrackMonocular(cv_ptr->image, timeStep);
+        }
         
-        // Check if tracking succeeded (non-zero pose)
+        // Process the result (existing code)
         if (!Tcw.matrix().isZero(0) && 
             !std::isnan(Tcw.matrix()(0,0)) && 
             !std::isinf(Tcw.matrix()(0,0))) {
-        // Convert to world-to-camera transform (for NeuralRecon)
-        Sophus::SE3f Twc = Tcw.inverse(); //* Pose with respect to global image coordinate
+            // Convert to world-to-camera transform
+            Sophus::SE3f Twc = Tcw.inverse();
         
         // Store the transform for broadcasting
         if (publish_tf_) {
@@ -258,6 +295,31 @@ void MonocularMode::Img_callback(const sensor_msgs::msg::Image& msg)
     } catch (...) {
         RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                           "Unknown exception in TrackMonocular");
+    }
+}
+
+void MonocularMode::Imu_callback(const sensor_msgs::msg::Imu& msg) {
+    // Skip if IMU is disabled
+    if (!use_imu_) return;
+    
+    // Convert ROS IMU message to ORB-SLAM3 IMU::Point
+    // Timestamp is in seconds
+    double timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9;
+    
+    ORB_SLAM3::IMU::Point imu_point(
+        msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z,
+        msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z,
+        timestamp
+    );
+    
+    // Store IMU measurement in buffer (thread-safe)
+    std::lock_guard<std::mutex> lock(imu_buffer_mutex_);
+    imu_buffer_.push_back(imu_point);
+    
+    // Keep buffer from growing too large
+    const size_t MAX_IMU_BUFFER = 1000;
+    if (imu_buffer_.size() > MAX_IMU_BUFFER) {
+        imu_buffer_.erase(imu_buffer_.begin());
     }
 }
 

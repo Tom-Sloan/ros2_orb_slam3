@@ -26,6 +26,7 @@
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include "sensor_msgs/msg/image.hpp"
+#include "sensor_msgs/msg/imu.hpp"
 #include "tf2_ros/transform_broadcaster.h"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
@@ -112,10 +113,19 @@ class MonocularMode : public rclcpp::Node
         geometry_msgs::msg::TransformStamped latest_transform_;
         bool new_transform_available_ = false;
 
+        //* IMU-related variables
+        rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr subImuMsg_subscription_;
+        std::string subImuMsgName = ""; // Topic to subscribe to receive IMU data
+        std::vector<ORB_SLAM3::IMU::Point> imu_buffer_;
+        std::mutex imu_buffer_mutex_;
+        bool use_imu_ = false;
+        double last_image_timestamp_ = 0.0;
+
         //* ROS callbacks
         void experimentSetting_callback(const std_msgs::msg::String& msg); // Callback to process settings sent over by Python node
         void Timestep_callback(const std_msgs::msg::Float64& time_msg); // Callback to process the timestep for this image
         void Img_callback(const sensor_msgs::msg::Image& msg); // Callback to process RGB image and semantic matrix sent by Python node
+        void Imu_callback(const sensor_msgs::msg::Imu& msg); // Callback to process IMU data
         
         //* Helper functions
         // ORB_SLAM3::eigenMatXf convertToEigenMat(const std_msgs::msg::Float32MultiArray& msg); // Helper method, converts semantic matrix eigenMatXf, a Eigen 4x4 float matrix
