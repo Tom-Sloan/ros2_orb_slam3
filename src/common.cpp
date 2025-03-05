@@ -29,11 +29,28 @@ MonocularMode::MonocularMode() :Node("mono_node_cpp")
     this->declare_parameter("node_name_arg", "not_given"); // Name of this agent 
     this->declare_parameter("voc_file_arg", "file_not_set"); // Needs to be overriden with appropriate name  
     this->declare_parameter("settings_file_path_arg", "file_path_not_set"); // path to settings file  
+    this->declare_parameter("publish_tf", true); // Whether to publish transforms
+    this->declare_parameter("visualize_trajectory", true); // Whether to visualize trajectory
+    this->declare_parameter("tf_broadcast_rate", 20.0); // Rate for TF broadcasting in Hz
     
     //* Watchdog, populate default values
     nodeName = "not_set";
     vocFilePath = "file_not_set";
     settingsFilePath = "file_not_set";
+    
+    // Get TF broadcasting parameters
+    publish_tf_ = this->get_parameter("publish_tf").as_bool();
+    visualize_trajectory_ = this->get_parameter("visualize_trajectory").as_bool();
+    tf_broadcast_rate_ = this->get_parameter("tf_broadcast_rate").as_double();
+    
+    // Initialize TF broadcaster
+    tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+    
+    // Setup trajectory publisher if visualization is enabled
+    if (visualize_trajectory_) {
+        trajectory_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "orb_slam3/trajectory", 10);
+    }
 
     //* Populate parameter values
     rclcpp::Parameter param1 = this->get_parameter("node_name_arg");
@@ -82,6 +99,13 @@ MonocularMode::MonocularMode() :Node("mono_node_cpp")
     //* subscribe to receive the timestep
     subTimestepMsg_subscription_= this->create_subscription<std_msgs::msg::Float64>(subTimestepMsgName, 1, std::bind(&MonocularMode::Timestep_callback, this, _1));
 
+    // Setup TF broadcasting timer if enabled
+    if (publish_tf_) {
+        tf_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(static_cast<int>(1000.0 / tf_broadcast_rate_)),
+            std::bind(&MonocularMode::broadcast_latest_transform, this));
+        RCLCPP_INFO(this->get_logger(), "TF broadcasting enabled at %.1f Hz", tf_broadcast_rate_);
+    }
     
     RCLCPP_INFO(this->get_logger(), "Waiting to finish handshake ......");
     
@@ -181,11 +205,121 @@ void MonocularMode::Img_callback(const sensor_msgs::msg::Image& msg)
     
     //* Perform all ORB-SLAM3 operations in Monocular mode
     //! Pose with respect to the camera coordinate frame not the world coordinate frame
-    Sophus::SE3f Tcw = pAgent->TrackMonocular(cv_ptr->image, timeStep); 
-    
-    //* An example of what can be done after the pose w.r.t camera coordinate frame is computed by ORB SLAM3
-    //Sophus::SE3f Twc = Tcw.inverse(); //* Pose with respect to global image coordinate, reserved for future use
-
+    Sophus::SE3f Tcw;
+    try {
+        Tcw = pAgent->TrackMonocular(cv_ptr->image, timeStep);
+        
+        // Check if tracking succeeded (non-zero pose)
+        if (!Tcw.matrix().isZero(0) && 
+            !std::isnan(Tcw.matrix()(0,0)) && 
+            !std::isinf(Tcw.matrix()(0,0))) {
+        // Convert to world-to-camera transform (for NeuralRecon)
+        Sophus::SE3f Twc = Tcw.inverse(); //* Pose with respect to global image coordinate
+        
+        // Store the transform for broadcasting
+        if (publish_tf_) {
+            // Update latest transform (used by broadcast_latest_transform)
+            latest_transform_.header.stamp = msg.header.stamp;
+            latest_transform_.header.frame_id = "world";
+            latest_transform_.child_frame_id = "camera";
+            
+            // Fill in translation
+            latest_transform_.transform.translation.x = Twc.translation().x();
+            latest_transform_.transform.translation.y = Twc.translation().y();
+            latest_transform_.transform.translation.z = Twc.translation().z();
+            
+            // Fill in rotation (as quaternion)
+            Eigen::Quaternionf q = Twc.unit_quaternion();
+            latest_transform_.transform.rotation.x = q.x();
+            latest_transform_.transform.rotation.y = q.y();
+            latest_transform_.transform.rotation.z = q.z();
+            latest_transform_.transform.rotation.w = q.w();
+            
+            new_transform_available_ = true;
+            
+            // Also broadcast immediately (in addition to timer-based broadcasts)
+            tf_broadcaster_->sendTransform(latest_transform_);
+        }
+        
+        // Update trajectory visualization if enabled
+        if (visualize_trajectory_) {
+            update_trajectory_visualization(Twc, msg.header.stamp);
+        }
+        
+        RCLCPP_DEBUG(this->get_logger(), "Publishing transform: [%.2f, %.2f, %.2f]", 
+                    Twc.translation().x(), Twc.translation().y(), Twc.translation().z());
+        } else {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
+                               "Tracking failed for this frame - invalid pose");
+        }
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                          "Exception in TrackMonocular: %s", e.what());
+    } catch (...) {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                          "Unknown exception in TrackMonocular");
+    }
 }
 
+// Timer callback for TF broadcasting
+void MonocularMode::broadcast_latest_transform() {
+    if (new_transform_available_) {
+        tf_broadcaster_->sendTransform(latest_transform_);
+        new_transform_available_ = false;
+    }
+}
+
+// Update trajectory visualization
+void MonocularMode::update_trajectory_visualization(const Sophus::SE3f& Twc, const rclcpp::Time& stamp) {
+    // Create new marker
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = "world";
+    marker.header.stamp = stamp;
+    marker.ns = "trajectory";
+    marker.id = trajectory_id_++;
+    marker.type = visualization_msgs::msg::Marker::SPHERE;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    
+    // Set position from transform
+    marker.pose.position.x = Twc.translation().x();
+    marker.pose.position.y = Twc.translation().y();
+    marker.pose.position.z = Twc.translation().z();
+    
+    // Set orientation from transform quaternion
+    Eigen::Quaternionf q = Twc.unit_quaternion();
+    marker.pose.orientation.x = q.x();
+    marker.pose.orientation.y = q.y();
+    marker.pose.orientation.z = q.z();
+    marker.pose.orientation.w = q.w();
+    
+    // Set scale and color
+    marker.scale.x = 0.05;
+    marker.scale.y = 0.05;
+    marker.scale.z = 0.05;
+    marker.color.a = 1.0;
+    marker.color.r = 0.0;
+    marker.color.g = 0.7;
+    marker.color.b = 0.2;
+    
+    // Keep for the entire session
+    marker.lifetime.sec = 0;
+    marker.lifetime.nanosec = 0;
+    
+    // Add to markers
+    trajectory_markers_.markers.push_back(marker);
+    
+    // Limit size of trajectory visualization
+    constexpr size_t MAX_TRAJECTORY_MARKERS = 1000;
+    if (trajectory_markers_.markers.size() > MAX_TRAJECTORY_MARKERS) {
+        trajectory_markers_.markers.erase(trajectory_markers_.markers.begin());
+        
+        // Update IDs after removing oldest marker
+        for (size_t i = 0; i < trajectory_markers_.markers.size(); ++i) {
+            trajectory_markers_.markers[i].id = i;
+        }
+    }
+    
+    // Publish trajectory
+    trajectory_pub_->publish(trajectory_markers_);
+}
 

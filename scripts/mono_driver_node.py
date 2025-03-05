@@ -57,11 +57,11 @@ class MonoDriver(Node):
         super().__init__(node_name) # Initializes the rclpy.Node class. It expects the name of the node
 
         # Initialize parameters to be passed from the command line (or launch file)
-        self.declare_parameter("settings_name","EuRoC")
+        self.declare_parameter("settings_name","EuRoC_mono_inertial")  # Use mono-inertial config
         self.declare_parameter("image_seq","NULL")
 
         #* Parse values sent by command line
-        self.settings_name = str(self.get_parameter('settings_name').value) 
+        self.settings_name = str(self.get_parameter('settings_name').value)
         self.image_seq = str(self.get_parameter('image_seq').value)
 
         # DEBUG
@@ -74,6 +74,21 @@ class MonoDriver(Node):
         self.home_dir = "/home/sam3/Desktop/Toms_Workspace/active_mapping/src/ros2_orb_slam3" #! Change this to match path to your workspace
         self.parent_dir = "TEST_DATASET" #! Change or provide path to the parent directory where data for all image sequences are stored
         self.image_sequence_dir = self.home_dir + "/" + self.parent_dir + "/" + self.image_seq # Full path to the image sequence folder
+
+        # Verify path exists
+        if not os.path.exists(self.image_sequence_dir):
+            print(f"WARNING: Image sequence directory not found: {self.image_sequence_dir}")
+            print("Trying alternative paths...")
+            # Try alternative locations
+            alt_paths = [
+                f"/home/sam3/Desktop/Toms_Workspace/active_mapping/src/ros2_orb_slam3/TEST_DATASET/{self.image_seq}",
+                f"/home/sam3/Desktop/Toms_Workspace/active_mapping/TEST_DATASET/{self.image_seq}",
+            ]
+            for path in alt_paths:
+                if os.path.exists(path):
+                    self.image_sequence_dir = path
+                    print(f"Found dataset at: {self.image_sequence_dir}")
+                    break
 
         print(f"self.image_sequence_dir: {self.image_sequence_dir}\n")
 
@@ -97,9 +112,9 @@ class MonoDriver(Node):
         self.sub_exp_ack_name = "/mono_py_driver/exp_settings_ack"
         self.pub_img_to_agent_name = "/mono_py_driver/img_msg"
         self.pub_timestep_to_agent_name = "/mono_py_driver/timestep_msg"
-        self.pub_imu_to_agent_name = "/imu/data"  # Default IMU topic that matches launch file
+        self.pub_imu_to_agent_name = "/mono_py_driver/imu_msg"  # Use our own topic to ensure consistent naming
         self.send_config = True # Set False once handshake is completed with the cpp node
-        self.use_imu = False  # Whether to publish IMU data (if available)
+        self.use_imu = True  # Always publish IMU data if available
         
         # Check if IMU data directory exists
         agent_imu_fld = self.image_sequence_dir + "/mav0/imu0"
@@ -116,7 +131,7 @@ class MonoDriver(Node):
 
         #* Build the configuration string to be sent out
         #self.exp_config_msg = self.settings_name + "/" + self.image_seq # Example EuRoC/sample_euroc_MH05
-        self.exp_config_msg = self.settings_name # Example EuRoC
+        self.exp_config_msg = "EuRoC_mono_inertial" # Use the inertial config directly
         print(f"Configuration to be sent: {self.exp_config_msg}")
 
 
@@ -136,6 +151,8 @@ class MonoDriver(Node):
         if self.use_imu:
             from sensor_msgs.msg import Imu
             self.publish_imu_msg_ = self.create_publisher(Imu, self.pub_imu_to_agent_name, 10)
+            # Setting this to true ensures we're actually using the IMU data
+            print("IMU data available and publisher initialized")
 
 
         # Initialize work variables for main logic
