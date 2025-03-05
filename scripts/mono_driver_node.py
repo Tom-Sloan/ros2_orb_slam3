@@ -150,9 +150,9 @@ class MonoDriver(Node):
         # Initialize IMU publisher if IMU data is available
         if self.use_imu:
             from sensor_msgs.msg import Imu
-            self.publish_imu_msg_ = self.create_publisher(Imu, self.pub_imu_to_agent_name, 10)
+            self.publish_imu_msg_ = self.create_publisher(Imu, '/imu/data', 10)  # Use standard topic name
             # Setting this to true ensures we're actually using the IMU data
-            print("IMU data available and publisher initialized")
+            print("IMU data available and publisher initialized on topic: /imu/data")
 
 
         # Initialize work variables for main logic
@@ -289,37 +289,71 @@ class MonoDriver(Node):
         if not self.imu_data:
             return
             
-        from sensor_msgs.msg import Imu
-        from geometry_msgs.msg import Vector3
-        from rclpy.time import Time
-        
-        # Find the closest IMU measurement to the current image timestamp
-        closest_timestamp = min(self.imu_data.keys(), key=lambda x: abs(x - current_timestamp))
-        imu_measurement = self.imu_data[closest_timestamp]
-        
-        # Create IMU message
-        imu_msg = Imu()
-        # Set header
-        imu_msg.header.stamp = self.get_clock().now().to_msg()
-        imu_msg.header.frame_id = "imu"
-        
-        # Set angular velocity (rad/s)
-        imu_msg.angular_velocity.x = imu_measurement['w'][0]
-        imu_msg.angular_velocity.y = imu_measurement['w'][1]
-        imu_msg.angular_velocity.z = imu_measurement['w'][2]
-        
-        # Set linear acceleration (m/s^2)
-        imu_msg.linear_acceleration.x = imu_measurement['a'][0]
-        imu_msg.linear_acceleration.y = imu_measurement['a'][1]
-        imu_msg.linear_acceleration.z = imu_measurement['a'][2]
-        
-        # Set default covariance (replace with actual values if available)
-        # -1 indicates unknown covariance
-        imu_msg.angular_velocity_covariance = [float(0.01), 0.0, 0.0, 0.0, float(0.01), 0.0, 0.0, 0.0, float(0.01)]
-        imu_msg.linear_acceleration_covariance = [float(0.01), 0.0, 0.0, 0.0, float(0.01), 0.0, 0.0, 0.0, float(0.01)]
-        
-        # Publish IMU message
-        self.publish_imu_msg_.publish(imu_msg)
+        try:
+            from sensor_msgs.msg import Imu
+            from geometry_msgs.msg import Vector3
+            from rclpy.time import Time
+            import math
+            
+            # Find the closest IMU measurement to the current image timestamp
+            closest_timestamp = min(self.imu_data.keys(), key=lambda x: abs(x - current_timestamp))
+            imu_measurement = self.imu_data[closest_timestamp]
+            
+            # Create IMU message
+            imu_msg = Imu()
+            
+            # Set header using the actual IMU timestamp for better synchronization
+            timestamp_sec = closest_timestamp / 1e9  # Convert nanoseconds to seconds
+            time_sec = int(timestamp_sec)
+            time_nanosec = int((timestamp_sec - time_sec) * 1e9)
+            
+            # Set stamp with the IMU timestamp
+            stamp = Time(seconds=time_sec, nanoseconds=time_nanosec).to_msg()
+            imu_msg.header.stamp = stamp
+            imu_msg.header.frame_id = "imu"
+            
+            # Set angular velocity (rad/s)
+            imu_msg.angular_velocity.x = float(imu_measurement['w'][0])
+            imu_msg.angular_velocity.y = float(imu_measurement['w'][1])
+            imu_msg.angular_velocity.z = float(imu_measurement['w'][2])
+            
+            # Set linear acceleration (m/s^2)
+            imu_msg.linear_acceleration.x = float(imu_measurement['a'][0])
+            imu_msg.linear_acceleration.y = float(imu_measurement['a'][1])
+            imu_msg.linear_acceleration.z = float(imu_measurement['a'][2])
+            
+            # Set orientation quaternion (identity since we don't have orientation data)
+            imu_msg.orientation.x = 0.0
+            imu_msg.orientation.y = 0.0
+            imu_msg.orientation.z = 0.0
+            imu_msg.orientation.w = 1.0
+            
+            # Set covariance matrices based on the config file
+            # IMU.NoiseGyro = 1.7e-4, IMU.NoiseAcc = 2.0e-3
+            gyro_noise = 1.7e-4
+            acc_noise = 2.0e-3
+            
+            # -1 for orientation covariance to indicate we don't have orientation data
+            imu_msg.orientation_covariance = [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            
+            # Set covariances for angular velocity and linear acceleration
+            imu_msg.angular_velocity_covariance = [
+                gyro_noise * gyro_noise, 0.0, 0.0,
+                0.0, gyro_noise * gyro_noise, 0.0,
+                0.0, 0.0, gyro_noise * gyro_noise
+            ]
+            
+            imu_msg.linear_acceleration_covariance = [
+                acc_noise * acc_noise, 0.0, 0.0,
+                0.0, acc_noise * acc_noise, 0.0,
+                0.0, 0.0, acc_noise * acc_noise
+            ]
+            
+            # Publish IMU message
+            self.publish_imu_msg_.publish(imu_msg)
+            
+        except Exception as e:
+            print(f"Error publishing IMU data: {e}")
     # ****************************************************************************************
         
 
